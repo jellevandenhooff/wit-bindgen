@@ -2,12 +2,13 @@
 //! that waitable.
 
 use super::cabi;
+use std::boxed::Box;
 use std::ffi::c_void;
-use std::future::Future;
-use std::marker;
+use std::future::{Future, poll_fn};
 use std::mem;
 use std::pin::Pin;
 use std::ptr;
+use std::ptr::NonNull;
 use std::task::{Context, Poll, Waker};
 
 /// Generic future-based operation on any "waitable" in the component model.
@@ -17,41 +18,26 @@ use std::task::{Context, Poll, Waker};
 /// [`WaitableOp`], which codifies the various state transitions and what to do
 /// on each state transition.
 pub struct WaitableOperation<S: WaitableOp> {
+    inner: NonNull<OperationInner<S>>,
+}
+
+struct OperationInner<S: WaitableOp> {
     op: S,
     state: WaitableOperationState<S>,
     /// Storage for the final result of this asynchronous operation, if it's
     /// completed asynchronously.
     completion_status: CompletionStatus,
+    detached: bool,
+    cancelling: bool,
 }
 
 /// Structure used to store the `u32` return code from the canonical ABI about
 /// an asynchronous operation.
-///
-/// When an asynchronous operation is started and it does not immediately
-/// complete then this structure is used to asynchronously fill in the return
-/// code. A `Pin<&mut CompletionStatus>` is used to register a pointer with
-/// `FutureState` to get filled in.
-///
-/// Note that this means that this type is participating in unsafe lifetime
-/// management and has properties it needs to uphold as a result. Specifically
-/// the `PhantomPinned` field here means that `Pin` actually has meaning for
-/// this structure, notably that once `Pin<&mut CompletionStatus>` is created
-/// then it's guaranteed the destructor will be run before the backing memory
-/// is deallocated. That's used in `WaitableOperation` above to share an
-/// internal pointer of this data structure with `FuturesState` safely. The
-/// destructor of `WaitableOperation` will deregister from `FutureState` meaning
-/// that if `FuturesState` has a pointer here then it should be valid .
 struct CompletionStatus {
     /// Where the async operation's code is filled in, and `None` until that
     /// happens.
     code: Option<u32>,
-
     waker: Option<Waker>,
-
-    /// This is necessary to ensure that `Pin<&mut CompletionStatus>` carries
-    /// the "pin guarantee", basically to mean that it's not safe to construct
-    /// `Pin<&mut CompletionStatus>` and it must somehow require `unsafe` code.
-    _pinned: marker::PhantomPinned,
 }
 
 /// Helper trait to be used with `WaitableOperation` to assist with machinery
@@ -123,6 +109,15 @@ pub unsafe trait WaitableOp {
     /// when an in-progress operation is cancelled so the in-progress result is
     /// first acquired and then transitioned to a cancel request.
     fn result_into_cancel(&mut self, result: Self::Result) -> Self::Cancel;
+
+    /// Whether dropping this operation is allowed to detach it from the Rust
+    /// future and let the component-model operation continue in the background.
+    fn detach_on_drop() -> bool
+    where
+        Self: Sized,
+    {
+        false
+    }
 }
 
 enum WaitableOperationState<S: WaitableOp> {
@@ -137,36 +132,59 @@ where
 {
     /// Creates a new operation in the initial state.
     pub fn new(op: S, state: S::Start) -> WaitableOperation<S> {
-        WaitableOperation {
+        let inner = Box::new(OperationInner {
             op,
             state: WaitableOperationState::Start(state),
             completion_status: CompletionStatus {
                 code: None,
                 waker: None,
-                _pinned: marker::PhantomPinned,
             },
+            detached: false,
+            cancelling: false,
+        });
+        WaitableOperation {
+            inner: NonNull::from(Box::leak(inner)),
         }
     }
 
-    fn pin_project(
-        self: Pin<&mut Self>,
-    ) -> (
-        &mut S,
-        &mut WaitableOperationState<S>,
-        Pin<&mut CompletionStatus>,
-    ) {
-        // SAFETY: this is the one method used to project from `Pin<&mut Self>`
-        // to the fields, and the contract we're deciding on is that
-        // `state` is never pinned but the `CompletionStatus` is. That's used
-        // to share a raw pointer with the completion callback with
-        // respect to `Option<u32>` internally.
+    fn inner(&self) -> &OperationInner<S> {
+        unsafe { self.inner.as_ref() }
+    }
+
+    fn inner_mut(&mut self) -> &mut OperationInner<S> {
+        unsafe { self.inner.as_mut() }
+    }
+
+    unsafe fn drop_inner(&mut self) {
+        drop(unsafe { Box::from_raw(self.inner.as_ptr()) });
+    }
+
+    unsafe fn register_raw(ptr: *mut OperationInner<S>, waitable: u32) {
+        let task = unsafe { cabi::wasip3_task_set(ptr::null_mut()) };
+        assert!(!task.is_null());
+        assert!(unsafe { (*task).version } >= cabi::WASIP3_TASK_V1);
+        let prev = unsafe {
+            ((*task).waitable_register)((*task).ptr, waitable, cabi_wake::<S>, ptr.cast())
+        };
+        if !prev.is_null() {
+            assert_eq!(ptr, prev.cast());
+        }
         unsafe {
-            let me = self.get_unchecked_mut();
-            (
-                &mut me.op,
-                &mut me.state,
-                Pin::new_unchecked(&mut me.completion_status),
-            )
+            cabi::wasip3_task_set(task);
+        }
+    }
+
+    unsafe fn unregister_raw(&mut self, waitable: u32) {
+        let ptr = self.inner.as_ptr();
+        let task = unsafe { cabi::wasip3_task_set(ptr::null_mut()) };
+        assert!(!task.is_null());
+        assert!(unsafe { (*task).version } >= cabi::WASIP3_TASK_V1);
+        let prev = unsafe { ((*task).waitable_unregister)((*task).ptr, waitable) };
+        if !prev.is_null() {
+            assert_eq!(ptr, prev.cast());
+        }
+        unsafe {
+            cabi::wasip3_task_set(task);
         }
     }
 
@@ -174,84 +192,36 @@ where
     ///
     /// * Fill in `completion_status` with the result of a completion event.
     /// * Call `cx.waker().wake()`.
-    pub fn register_waker(self: Pin<&mut Self>, waitable: u32, cx: &mut Context) {
-        let (_, _, mut completion_status) = self.pin_project();
-        debug_assert!(completion_status.as_mut().code_mut().is_none());
-        *completion_status.as_mut().waker_mut() = Some(cx.waker().clone());
-
-        // SAFETY: There's quite a lot going on here. First is the usage of
-        // `task` below, and for that see `unregister_waker` below for why this
-        // pattern should be safe.
-        //
-        // Otherwise we're handing off a pointer to `completion_status` to the
-        // `task` itself. That should be safe as we're guaranteed, via
-        // `Pin<&mut Self>`, that before `&mut Self` is deallocated the
-        // destructor will be run which will perform de-registration via
-        // cancellation.
+    pub fn register_waker(&mut self, waitable: u32, cx: &mut Context) {
+        let inner = self.inner_mut();
+        debug_assert!(inner.completion_status.code.is_none());
+        inner.completion_status.waker = Some(cx.waker().clone());
         unsafe {
-            let task = cabi::wasip3_task_set(ptr::null_mut());
-            assert!(!task.is_null());
-            assert!((*task).version >= cabi::WASIP3_TASK_V1);
-            let ptr: *mut CompletionStatus = completion_status.get_unchecked_mut();
-            let prev = ((*task).waitable_register)((*task).ptr, waitable, cabi_wake, ptr.cast());
-            // We might be inserting a waker for the first time or overwriting
-            // the previous waker. Only assert the expected value here if the
-            // previous value was non-null.
-            if !prev.is_null() {
-                assert_eq!(ptr, prev.cast());
-            }
-            cabi::wasip3_task_set(task);
-        }
-
-        unsafe extern "C" fn cabi_wake(ptr: *mut c_void, code: u32) {
-            let ptr: &mut CompletionStatus = unsafe { &mut *ptr.cast::<CompletionStatus>() };
-            ptr.code = Some(code);
-            ptr.waker.take().unwrap().wake()
+            Self::register_raw(self.inner.as_ptr(), waitable);
         }
     }
 
     /// Deregisters the corresponding `register_waker` within the current task
     /// for the `waitable` passed here.
-    ///
-    /// This relinquishes control of the original `completion_status` pointer
-    /// passed to `register_waker` after this call has completed.
-    pub fn unregister_waker(self: Pin<&mut Self>, waitable: u32) {
-        // SAFETY: the contract of `wasip3_task_set` is that the returned
-        // pointer is valid for the lifetime of our entire task, so it's valid
-        // for this stack frame. Additionally we assert it's non-null to
-        // double-check it's initialized and additionally check the version for
-        // the fields that we access.
-        //
-        // Otherwise the `waitable_unregister` callback should be safe because:
-        //
-        // * We're fulfilling the contract where the first argument must be
-        //   `(*task).ptr`
-        // * We own the `waitable` that we're passing in, so we're fulfilling
-        //   the contract that arbitrary waitables for other units of work
-        //   aren't being manipulated.
+    pub fn unregister_waker(&mut self, waitable: u32) {
         unsafe {
-            let task = cabi::wasip3_task_set(ptr::null_mut());
-            assert!(!task.is_null());
-            assert!((*task).version >= cabi::WASIP3_TASK_V1);
-            let prev = ((*task).waitable_unregister)((*task).ptr, waitable);
+            self.unregister_raw(waitable);
+        }
+    }
 
-            // Note that `_prev` here is not guaranteed to be either `NULL` or
-            // not. A racy completion notification may have come in and
-            // removed our waitable from the map even though we're in the
-            // `InProgress` state, meaning it may not be present.
-            //
-            // The main thing is that after this method is called the
-            // internal `completion_status` is guaranteed to no longer be in
-            // `task`.
-            //
-            // Note, though, that if present this must be our `CompletionStatus`
-            // pointer.
-            if !prev.is_null() {
-                let ptr: *mut CompletionStatus = self.pin_project().2.get_unchecked_mut();
-                assert_eq!(ptr, prev.cast());
+    fn apply_code(&mut self, code: u32) -> Poll<S::Result> {
+        let inner = self.inner_mut();
+        let WaitableOperationState::InProgress(in_progress) =
+            mem::replace(&mut inner.state, WaitableOperationState::Done)
+        else {
+            unreachable!()
+        };
+        match inner.op.in_progress_update(in_progress, code) {
+            Ok(result) => Poll::Ready(result),
+            Err(in_progress) => {
+                inner.state = WaitableOperationState::InProgress(in_progress);
+                Poll::Pending
             }
-
-            cabi::wasip3_task_set(task);
         }
     }
 
@@ -259,224 +229,224 @@ where
     ///
     /// This is intended to be used within `Future::poll`.
     pub fn poll_complete(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<S::Result> {
-        use WaitableOperationState::*;
-
-        let (op, state, completion_status) = self.as_mut().pin_project();
-
-        // First up, determine the completion status, if any, that's available.
-        let optional_code = match state {
-            // If this operation hasn't actually started yet then now's the
-            // time to start it.
-            Start(_) => {
-                let Start(s) = mem::replace(state, Done) else {
+        let me = unsafe { self.as_mut().get_unchecked_mut() };
+        assert!(
+            !me.inner().cancelling,
+            "cannot poll operation after requesting async cancellation"
+        );
+        let optional_code = match &mut me.inner_mut().state {
+            WaitableOperationState::Start(_) => {
+                let WaitableOperationState::Start(s) =
+                    mem::replace(&mut me.inner_mut().state, WaitableOperationState::Done)
+                else {
                     unreachable!()
                 };
-                let (code, s) = op.start(s);
-                *state = InProgress(s);
+                let (code, s) = me.inner_mut().op.start(s);
+                me.inner_mut().state = WaitableOperationState::InProgress(s);
                 Some(code)
             }
-
-            // This operation was previously queued so we're just waiting on
-            // the completion to come in. Read the completion status and
-            // interpret it down below.
-            //
-            // Note that it's the responsibility of the completion callback at
-            // the ABI level that we install to fill in this pointer, e.g. it's
-            // part of the `register_waker` contract.
-            InProgress(_) => completion_status.code_mut().take(),
-
-            // This write has already completed, it's a Rust-level API violation
-            // to call this function again.
-            Done => panic!("cannot re-poll after operation completes"),
+            WaitableOperationState::InProgress(_) => me.inner_mut().completion_status.code.take(),
+            WaitableOperationState::Done => panic!("cannot re-poll after operation completes"),
         };
 
-        self.poll_complete_with_code(Some(cx), optional_code)
-    }
-
-    /// After acquiring the current return of this operation in `optional_code`,
-    /// figures out what to do with it.
-    ///
-    /// The `cx` argument is optional to do nothing in the case that
-    /// `optional_code` is not present.
-    fn poll_complete_with_code(
-        mut self: Pin<&mut Self>,
-        cx: Option<&mut Context>,
-        optional_code: Option<u32>,
-    ) -> Poll<S::Result> {
-        use WaitableOperationState::*;
-
-        let (op, state, _completion_status) = self.as_mut().pin_project();
-
-        // If a status code is provided, then extract the in-progress state and
-        // see what it thinks about this code. If we're done, yay! If not then
-        // record the new in-progress state and fall through to registering a
-        // waker.
-        //
-        // If no status code is available then that means we were polled before
-        // the status came back, so just re-register the waker.
         if let Some(code) = optional_code {
-            let InProgress(in_progress) = mem::replace(state, Done) else {
-                unreachable!()
-            };
-            match op.in_progress_update(in_progress, code) {
-                Ok(result) => return Poll::Ready(result),
-                Err(in_progress) => *state = InProgress(in_progress),
+            if let Poll::Ready(result) = me.apply_code(code) {
+                return Poll::Ready(result);
             }
         }
 
-        let in_progress = match state {
-            InProgress(s) => s,
-            _ => unreachable!(),
-        };
-
-        // The operation is still in progress.
-        //
-        // Register the `cx.waker()` to get notified when `writer.handle`
-        // receives its completion.
-        if let Some(cx) = cx {
-            let handle = op.in_progress_waitable(in_progress);
-            self.register_waker(handle, cx);
-        }
+        let handle = me.inner_mut().waitable();
+        me.register_waker(handle, cx);
         Poll::Pending
     }
 
     /// Cancels the in-flight operation, if it's still in-flight, and sees what
     /// happened.
-    ///
-    /// Defers to `S` how to communicate the current status through the
-    /// cancellation type.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the operation has already been completed via `poll_complete`
-    /// above.
-    /// Panics if this method is called twice.
     pub fn cancel(mut self: Pin<&mut Self>) -> S::Cancel {
-        use WaitableOperationState::*;
-
-        let (op, state, mut completion_status) = self.as_mut().pin_project();
-        let in_progress = match state {
-            // This operation was never actually started, so there's no need to
-            // cancel anything, just pull out the value and return it.
-            Start(_) => {
-                let Start(s) = mem::replace(state, Done) else {
+        let me = unsafe { self.as_mut().get_unchecked_mut() };
+        match &mut me.inner_mut().state {
+            WaitableOperationState::Start(_) => {
+                let WaitableOperationState::Start(s) =
+                    mem::replace(&mut me.inner_mut().state, WaitableOperationState::Done)
+                else {
                     unreachable!()
                 };
-                return op.start_cancelled(s);
+                return me.inner_mut().op.start_cancelled(s);
             }
-
-            // This operation is actively in progress, fall through to below.
-            InProgress(s) => s,
-
-            // This operation was already completed after a `poll_complete`
-            // above advanced to the `Done` state, or this was cancelled twice.
-            // In such situations this is a programmer error to call this
-            // method, so panic.
-            Done => panic!("cannot cancel operation after completing it"),
-        };
-
-        // Our operation is in-progress, let's take a look at the pending
-        // completion code, if any.
-        match completion_status.as_mut().code_mut().take() {
-            // A completion code, or status update, is available. This can
-            // happen for example if an export received a status update for
-            // this operation but then during the subsequent poll we decided
-            // that the future should be dropped instead, aka a race between
-            // two events. In this situation though to fully process the
-            // cancellation we need to see what's up, so check to see if the
-            // operation is done with this code.
-            //
-            // Note that in this branch it's known that this operation's waker
-            // is not registered with the exported task because the exported
-            // task already delivered us the completion code, which
-            // automatically deregisters it at this time.
-            Some(code) => {
-                match self.as_mut().poll_complete_with_code(None, Some(code)) {
-                    // The operation completed without us needing to cancel it,
-                    // so just convert that to the `Cancel` type. In this
-                    // situation no cancellation is necessary, the async
-                    // operation is now inert, and we can immediately return.
-                    Poll::Ready(result) => {
-                        return self.as_mut().pin_project().0.result_into_cancel(result);
-                    }
-
-                    // The operation, despite receiving an update via a code,
-                    // has not yet completed. In this case we do indeed need to
-                    // perform cancellation, so fall through to below.
-                    Poll::Pending => {}
-                }
+            WaitableOperationState::Done => {
+                panic!("cannot cancel operation after completing it");
             }
+            WaitableOperationState::InProgress(_) => {}
+        }
 
-            // A completion code is not yet available. In this situation we
-            // deregister our waker from the exported task's waitable set and
-            // callback handling since we'll be no longer waiting for events.
-            // Cancellation below happens synchronously.
-            //
-            // After we've unregistered fall through to below.
-            None => {
-                let waitable = op.in_progress_waitable(in_progress);
-                self.as_mut().unregister_waker(waitable);
+        if let Some(code) = me.inner_mut().completion_status.code.take() {
+            if let Poll::Ready(result) = me.apply_code(code) {
+                return me.inner_mut().op.result_into_cancel(result);
+            }
+        } else {
+            let waitable = me.inner_mut().waitable();
+            me.unregister_waker(waitable);
+        }
+
+        let code = me.inner_mut().cancel_code();
+        match me.apply_code(code) {
+            Poll::Ready(result) => me.inner_mut().op.result_into_cancel(result),
+            Poll::Pending => unreachable!(),
+        }
+    }
+
+    fn poll_cancel(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<S::Cancel> {
+        let me = unsafe { self.as_mut().get_unchecked_mut() };
+        match &mut me.inner_mut().state {
+            WaitableOperationState::Start(_) => {
+                let WaitableOperationState::Start(s) =
+                    mem::replace(&mut me.inner_mut().state, WaitableOperationState::Done)
+                else {
+                    unreachable!()
+                };
+                return Poll::Ready(me.inner_mut().op.start_cancelled(s));
+            }
+            WaitableOperationState::Done => {
+                panic!("cannot cancel operation after completing it");
+            }
+            WaitableOperationState::InProgress(_) => {}
+        }
+
+        if let Some(code) = me.inner_mut().completion_status.code.take() {
+            if let Poll::Ready(result) = me.apply_code(code) {
+                return Poll::Ready(me.inner_mut().op.result_into_cancel(result));
             }
         }
 
-        // This operation is guaranteed actively in progress at this point.
-        // That means we really do in fact need to cancel it. Here the
-        // appropriate cancellation intrinsic for the component model is
-        // invoked which returns the final completion status for this
-        // operation.
-        //
-        // The completion code is forwarded to `poll_complete_with_code` which
-        // determines what happened as a result. Note that at this time
-        // cancellation is required to be a synchronous operation in Rust, even
-        // if it's async in the component model, since that's the only way for
-        // this to be sound. Rust doesn't currently have linear types or async
-        // destructors for example to ensure otherwise that if this were to
-        // proceed asynchronously that we could rely on it being invoked.
-        let (op, InProgress(in_progress), _) = self.as_mut().pin_project() else {
-            unreachable!()
-        };
-        let code = op.in_progress_cancel(in_progress);
-        match self.as_mut().poll_complete_with_code(None, Some(code)) {
-            Poll::Ready(result) => self.as_mut().pin_project().0.result_into_cancel(result),
-            Poll::Pending => unreachable!(),
+        if !me.inner().cancelling {
+            me.inner_mut().cancelling = true;
+            let code = me.inner_mut().cancel_code();
+            if let Poll::Ready(result) = me.apply_code(code) {
+                return Poll::Ready(me.inner_mut().op.result_into_cancel(result));
+            }
+        }
+
+        let waitable = me.inner_mut().waitable();
+        me.register_waker(waitable, cx);
+        Poll::Pending
+    }
+
+    pub async fn cancel_async(mut self: Pin<&mut Self>) -> S::Cancel {
+        poll_fn(|cx| self.as_mut().poll_cancel(cx)).await
+    }
+
+    fn detach(&mut self) {
+        let inner = self.inner_mut();
+        inner.detached = true;
+        inner.completion_status.waker = None;
+
+        match inner.state {
+            WaitableOperationState::Start(_) => unsafe {
+                self.drop_inner();
+            },
+            WaitableOperationState::Done => unsafe {
+                self.drop_inner();
+            },
+            WaitableOperationState::InProgress(_) => {
+                if let Some(code) = inner.completion_status.code.take() {
+                    unsafe {
+                        OperationInner::<S>::on_detached_code(self.inner.as_ptr(), code);
+                    }
+                }
+            }
         }
     }
 
     /// Returns whether or not this operation has completed.
     pub fn is_done(&self) -> bool {
-        matches!(self.state, WaitableOperationState::Done)
+        matches!(self.inner().state, WaitableOperationState::Done)
     }
 }
 
 impl<S: WaitableOp> Future for WaitableOperation<S> {
     type Output = S::Result;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<S::Result> {
-        self.poll_complete(cx)
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<S::Result> {
+        self.as_mut().poll_complete(cx)
     }
 }
 
 impl<S: WaitableOp> Drop for WaitableOperation<S> {
     fn drop(&mut self) {
-        // If this operation has already completed then skip cancellation,
-        // otherwise it's our job to cancel anything in-flight.
         if self.is_done() {
+            unsafe {
+                self.drop_inner();
+            }
             return;
         }
 
-        // SAFETY: we're in the destructor here so the value `self` is about
-        // to go away and we can guarantee we're not moving out of it.
-        let pin = unsafe { Pin::new_unchecked(self) };
+        if S::detach_on_drop() {
+            self.detach();
+            return;
+        }
+
+        let pin = unsafe { Pin::new_unchecked(&mut *self) };
         pin.cancel();
+        unsafe {
+            self.drop_inner();
+        }
     }
 }
 
-impl CompletionStatus {
-    fn code_mut(self: Pin<&mut Self>) -> &mut Option<u32> {
-        unsafe { &mut self.get_unchecked_mut().code }
+impl<S: WaitableOp> OperationInner<S> {
+    fn waitable(&mut self) -> u32 {
+        let op = &mut self.op;
+        let in_progress = match &self.state {
+            WaitableOperationState::InProgress(in_progress) => in_progress,
+            _ => unreachable!(),
+        };
+        op.in_progress_waitable(in_progress)
     }
 
-    fn waker_mut(self: Pin<&mut Self>) -> &mut Option<Waker> {
-        unsafe { &mut self.get_unchecked_mut().waker }
+    fn cancel_code(&mut self) -> u32 {
+        let op = &mut self.op;
+        let in_progress = match &mut self.state {
+            WaitableOperationState::InProgress(in_progress) => in_progress,
+            _ => unreachable!(),
+        };
+        op.in_progress_cancel(in_progress)
+    }
+
+    unsafe fn on_detached_code(ptr: *mut Self, code: u32) {
+        let me = unsafe { &mut *ptr };
+        let WaitableOperationState::InProgress(in_progress) =
+            mem::replace(&mut me.state, WaitableOperationState::Done)
+        else {
+            unreachable!()
+        };
+        match me.op.in_progress_update(in_progress, code) {
+            Ok(result) => {
+                drop(result);
+                unsafe {
+                    drop(Box::from_raw(ptr));
+                }
+            }
+            Err(in_progress) => {
+                me.state = WaitableOperationState::InProgress(in_progress);
+                let waitable = me.waitable();
+                unsafe {
+                    WaitableOperation::<S>::register_raw(ptr, waitable);
+                }
+            }
+        }
+    }
+}
+
+unsafe extern "C" fn cabi_wake<S: WaitableOp>(ptr: *mut c_void, code: u32) {
+    let me = unsafe { &mut *ptr.cast::<OperationInner<S>>() };
+    if me.detached {
+        unsafe {
+            OperationInner::<S>::on_detached_code(ptr.cast(), code);
+        }
+    } else {
+        me.completion_status.code = Some(code);
+        if let Some(waker) = me.completion_status.waker.take() {
+            waker.wake();
+        }
     }
 }

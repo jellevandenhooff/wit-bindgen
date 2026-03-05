@@ -533,38 +533,19 @@ pub unsafe fn callback(event0: u32, event1: u32, event2: u32) -> u32 {
 
 /// Run the specified future to completion, returning the result.
 ///
-/// This uses `waitable-set.wait` to poll for progress on any in-progress calls
-/// to async-lowered imports as necessary.
+/// This helper is intentionally unavailable in the non-blocking runtime
+/// prototype. Driving component-model progress synchronously requires blocking
+/// on `waitable-set.wait`/`poll`, which defeats the purpose of this experiment.
 // TODO: refactor so `'static` bounds aren't necessary
 pub fn block_on<T: 'static>(future: impl Future<Output = T>) -> T {
-    let mut result = None;
-    let mut state = FutureState::new(Box::pin(async {
-        result = Some(future.await);
-    }));
-    let mut event = (EVENT_NONE, 0, 0);
-    loop {
-        match state.callback(event.0, event.1, event.2) {
-            CallbackCode::Exit => {
-                drop(state);
-                break result.unwrap();
-            }
-            CallbackCode::Yield => event = state.waitable_set.as_ref().unwrap().poll(),
-            CallbackCode::Wait(_) => event = state.waitable_set.as_ref().unwrap().wait(),
-        }
-    }
+    drop(future);
+    panic!("wit-bindgen non-blocking prototype does not support block_on")
 }
 
 /// Call the `yield` canonical built-in function.
 ///
-/// This yields control to the host temporarily, allowing other tasks to make
-/// progress. It's a good idea to call this inside a busy loop which does not
-/// otherwise ever yield control the host.
-///
-/// Note that this function is a blocking function, not an `async` function.
-/// That means that this is not an async yield which allows other tasks in this
-/// component to progress, but instead this will block the current function
-/// until the host gets back around to returning from this yield. Asynchronous
-/// functions should probably use [`yield_async`] instead.
+/// This helper is intentionally unavailable in the non-blocking runtime
+/// prototype. Use [`yield_async`] instead.
 ///
 /// # Return Value
 ///
@@ -575,18 +556,7 @@ pub fn block_on<T: 'static>(future: impl Future<Output = T>) -> T {
 /// at this yield point. The caller should return back and exit from the task
 /// ASAP in this situation.
 pub fn yield_blocking() -> bool {
-    extern_wasm! {
-        #[link(wasm_import_module = "$root")]
-        unsafe extern "C" {
-            #[link_name = "[thread-yield]"]
-            fn yield_() -> bool;
-        }
-    }
-
-    // Note that the return value from the raw intrinsic is inverted, the
-    // canonical ABI returns "did this task get cancelled" while this function
-    // works as "should work continue going".
-    unsafe { !yield_() }
+    panic!("wit-bindgen non-blocking prototype does not support yield_blocking")
 }
 
 /// The asynchronous counterpart to [`yield_blocking`].

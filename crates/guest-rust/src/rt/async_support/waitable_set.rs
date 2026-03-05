@@ -21,6 +21,7 @@ impl WaitableSet {
         unsafe { join(waitable, 0) }
     }
 
+    #[allow(dead_code)]
     pub fn wait(&self) -> (u32, u32, u32) {
         unsafe {
             let mut payload = [0; 2];

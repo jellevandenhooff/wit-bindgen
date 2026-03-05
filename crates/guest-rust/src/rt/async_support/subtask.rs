@@ -75,7 +75,7 @@ pub unsafe trait Subtask {
 
     /// Helper function to actually perform this asynchronous call with
     /// `params`.
-    fn call(&mut self, params: Self::Params) -> impl Future<Output = Self::Results>
+    fn call(self, params: Self::Params) -> impl Future<Output = Self::Results>
     where
         Self: Sized,
     {
@@ -93,13 +93,13 @@ pub unsafe trait Subtask {
     }
 }
 
-struct SubtaskOps<'a, T>(&'a mut T);
+struct SubtaskOps<T>(T);
 
 struct Start<T: Subtask> {
     params: T::Params,
 }
 
-unsafe impl<T: Subtask> WaitableOp for SubtaskOps<'_, T> {
+unsafe impl<T: Subtask> WaitableOp for SubtaskOps<T> {
     type Start = Start<T>;
     type InProgress = InProgress<T>;
     type Result = Result<T::Results, ()>;
@@ -148,7 +148,7 @@ unsafe impl<T: Subtask> WaitableOp for SubtaskOps<'_, T> {
             // Still not done yet, but we can record that this is started and
             // otherwise deallocate lists in the parameters.
             STATUS_STARTED => {
-                state.flag_started(self.0);
+                state.flag_started(&mut self.0);
                 Err(state)
             }
 
@@ -156,7 +156,7 @@ unsafe impl<T: Subtask> WaitableOp for SubtaskOps<'_, T> {
                 // Conditionally flag as started if we haven't otherwise
                 // explicitly transitioned through `STATUS_STARTED`.
                 if !state.started {
-                    state.flag_started(self.0);
+                    state.flag_started(&mut self.0);
                 }
 
                 // Now that our results have been written we can read them.
@@ -164,7 +164,7 @@ unsafe impl<T: Subtask> WaitableOp for SubtaskOps<'_, T> {
                 // Note that by dropping `state` here we'll both deallocate the
                 // params/results storage area as well as the subtask handle
                 // itself.
-                let ptr = state.ptr_results(self.0);
+                let ptr = state.ptr_results(&mut self.0);
                 unsafe { Ok(Ok(self.0.results_lift(ptr))) }
             }
 
@@ -201,7 +201,7 @@ unsafe impl<T: Subtask> WaitableOp for SubtaskOps<'_, T> {
             // state.
             STATUS_RETURNED_CANCELLED => {
                 if !state.started {
-                    state.flag_started(self.0);
+                    state.flag_started(&mut self.0);
                 }
                 Ok(Err(()))
             }
@@ -223,6 +223,13 @@ unsafe impl<T: Subtask> WaitableOp for SubtaskOps<'_, T> {
 
     fn result_into_cancel(&mut self, result: Self::Result) -> Self::Cancel {
         result
+    }
+
+    fn detach_on_drop() -> bool
+    where
+        Self: Sized,
+    {
+        true
     }
 }
 
@@ -276,7 +283,7 @@ impl<T: Subtask> InProgress<T> {
 extern_wasm! {
     #[link(wasm_import_module = "$root")]
     unsafe extern "C" {
-        #[link_name = "[subtask-cancel]"]
+        #[link_name = "[async-lower][subtask-cancel]"]
         fn cancel(handle: u32) -> u32;
         #[link_name = "[subtask-drop]"]
         fn drop(handle: u32);

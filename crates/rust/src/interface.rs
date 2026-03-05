@@ -675,9 +675,9 @@ pub mod vtable{ordinal} {{
     unsafe extern "C" {{
         #[link_name = "[{import_prefix}-new-{index}]{func_name}"]
         fn new() -> u64;
-        #[link_name = "[{import_prefix}-cancel-write-{index}]{func_name}"]
+        #[link_name = "[async-lower][{import_prefix}-cancel-write-{index}]{func_name}"]
         fn cancel_write(_: u32) -> u32;
-        #[link_name = "[{import_prefix}-cancel-read-{index}]{func_name}"]
+        #[link_name = "[async-lower][{import_prefix}-cancel-read-{index}]{func_name}"]
         fn cancel_read(_: u32) -> u32;
         #[link_name = "[{import_prefix}-drop-writable-{index}]{func_name}"]
         fn drop_writable(_: u32);

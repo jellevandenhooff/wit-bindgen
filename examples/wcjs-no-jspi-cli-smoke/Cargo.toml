@@ -1,0 +1,14 @@
+[package]
+name = "wcjs-no-jspi-cli-smoke"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = { path = "../../crates/guest-rust", features = ["async-spawn"] }
+futures = { version = "0.3", default-features = false, features = ["alloc"] }
+
+[workspace]

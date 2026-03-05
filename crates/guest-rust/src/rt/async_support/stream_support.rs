@@ -241,23 +241,24 @@ where
     ///
     /// The returned [`StreamWrite`] future can be cancelled like any other Rust
     /// future via `drop`, but this means that `values` will be lost within the
-    /// future. The [`StreamWrite::cancel`] method can be used to re-acquire the
-    /// in-progress write that is being done with `values`. This is effectively
-    /// a way of forcing the future to immediately resolve.
+    /// future. The [`StreamWrite::cancel`] method can be used to await
+    /// cancellation and re-acquire the in-progress write that is being done
+    /// with `values`.
     ///
     /// Note that if this future is cancelled via `drop` it does not mean that
     /// no values were sent. It may be possible that values were still sent
     /// despite being cancelled. Cancelling a write and determining what
     /// happened must be done with [`StreamWrite::cancel`].
-    pub fn write(&mut self, values: Vec<O::Payload>) -> RawStreamWrite<'_, O> {
-        self.write_buf(AbiBuffer::new(values, self.ops.clone()))
+    pub fn write(self, values: Vec<O::Payload>) -> RawStreamWrite<O> {
+        let ops = self.ops.clone();
+        self.write_buf(AbiBuffer::new(values, ops))
     }
 
     /// Same as [`StreamWriter::write`], except this takes [`AbiBuffer<T>`]
     /// instead of `Vec<T>`.
-    pub fn write_buf(&mut self, values: AbiBuffer<O>) -> RawStreamWrite<'_, O> {
+    pub fn write_buf(self, values: AbiBuffer<O>) -> RawStreamWrite<O> {
         RawStreamWrite {
-            op: WaitableOperation::new(StreamWriteOp { writer: self }, values),
+            op: WaitableOperation::new(StreamWriteOp(std::marker::PhantomData), (self, values)),
         }
     }
 
@@ -268,9 +269,9 @@ where
     /// all of `values` provided into this stream. Upon completion the same
     /// vector will be returned and any remaining elements in the vector were
     /// not sent because the stream was dropped.
-    pub async fn write_all(&mut self, values: Vec<O::Payload>) -> Vec<O::Payload> {
+    pub async fn write_all(self, values: Vec<O::Payload>) -> (Self, Vec<O::Payload>) {
         // Perform an initial write which converts `values` into `AbiBuffer`.
-        let (mut status, mut buf) = self.write(values).await;
+        let (mut writer, mut status, mut buf) = self.write(values).await;
 
         // While the previous write completed and there's still remaining items
         // in the buffer, perform another write.
@@ -278,7 +279,7 @@ where
             if buf.remaining() == 0 {
                 break;
             }
-            (status, buf) = self.write_buf(buf).await;
+            (writer, status, buf) = writer.write_buf(buf).await;
 
             // FIXME(WebAssembly/component-model#490)
             if status == StreamResult::Cancelled {
@@ -289,7 +290,7 @@ where
         // Return back any values that weren't written by shifting them to the
         // front of the returned vector.
         assert!(buf.remaining() == 0 || matches!(status, StreamResult::Dropped));
-        buf.into_vec()
+        (writer, buf.into_vec())
     }
 
     /// Writes the singular `value` provided
@@ -301,11 +302,12 @@ where
     /// If the other end hangs up then the value is returned back as
     /// `Some(value)`, otherwise `None` is returned indicating the value was
     /// sent.
-    pub async fn write_one(&mut self, value: O::Payload) -> Option<O::Payload> {
+    pub async fn write_one(self, value: O::Payload) -> (Self, Option<O::Payload>) {
         // TODO: can probably be a bit more efficient about this and avoid
         // moving `value` onto the heap in some situations, but that's left as
         // an optimization for later.
-        self.write_all(std::vec![value]).await.pop()
+        let (writer, mut remaining) = self.write_all(std::vec![value]).await;
+        (writer, remaining.pop())
     }
 }
 
@@ -333,16 +335,14 @@ where
 }
 
 /// Represents a write operation which may be cancelled prior to completion.
-pub type StreamWrite<'a, T> = RawStreamWrite<'a, &'static StreamVtable<T>>;
+pub type StreamWrite<T> = RawStreamWrite<&'static StreamVtable<T>>;
 
 /// Represents a write operation which may be cancelled prior to completion.
-pub struct RawStreamWrite<'a, O: StreamOps> {
-    op: WaitableOperation<StreamWriteOp<'a, O>>,
+pub struct RawStreamWrite<O: StreamOps> {
+    op: WaitableOperation<StreamWriteOp<O>>,
 }
 
-struct StreamWriteOp<'a, O: StreamOps> {
-    writer: &'a mut RawStreamWriter<O>,
-}
+struct StreamWriteOp<O: StreamOps>(std::marker::PhantomData<O>);
 
 /// Result of a [`StreamWriter::write`] or [`StreamReader::read`] operation,
 /// yielded by the [`StreamWrite`] or [`StreamRead`] futures.
@@ -359,84 +359,91 @@ pub enum StreamResult {
     Cancelled,
 }
 
-unsafe impl<'a, O> WaitableOp for StreamWriteOp<'a, O>
+unsafe impl<O> WaitableOp for StreamWriteOp<O>
 where
     O: StreamOps,
 {
-    type Start = AbiBuffer<O>;
-    type InProgress = AbiBuffer<O>;
-    type Result = (StreamResult, AbiBuffer<O>);
-    type Cancel = (StreamResult, AbiBuffer<O>);
+    type Start = (RawStreamWriter<O>, AbiBuffer<O>);
+    type InProgress = (RawStreamWriter<O>, AbiBuffer<O>);
+    type Result = (RawStreamWriter<O>, StreamResult, AbiBuffer<O>);
+    type Cancel = (RawStreamWriter<O>, StreamResult, AbiBuffer<O>);
 
-    fn start(&mut self, buf: Self::Start) -> (u32, Self::InProgress) {
-        if self.writer.done {
-            return (DROPPED, buf);
+    fn start(&mut self, (mut writer, buf): Self::Start) -> (u32, Self::InProgress) {
+        if writer.done {
+            return (DROPPED, (writer, buf));
         }
 
         let (ptr, len) = buf.abi_ptr_and_len();
         // SAFETY: sure hope this is safe, everything in this module and
         // `AbiBuffer` is trying to make this safe.
-        let code = unsafe { self.writer.ops.start_write(self.writer.handle, ptr, len) };
+        let code = unsafe { writer.ops.start_write(writer.handle, ptr, len) };
         rtdebug!(
             "stream.write({}, {ptr:?}, {len}) = {code:#x}",
-            self.writer.handle
+            writer.handle
         );
-        (code, buf)
+        (code, (writer, buf))
     }
 
-    fn start_cancelled(&mut self, buf: Self::Start) -> Self::Cancel {
-        (StreamResult::Cancelled, buf)
+    fn start_cancelled(&mut self, (writer, buf): Self::Start) -> Self::Cancel {
+        (writer, StreamResult::Cancelled, buf)
     }
 
     fn in_progress_update(
         &mut self,
-        mut buf: Self::InProgress,
+        (mut writer, mut buf): Self::InProgress,
         code: u32,
     ) -> Result<Self::Result, Self::InProgress> {
         match ReturnCode::decode(code) {
-            ReturnCode::Blocked => Err(buf),
-            ReturnCode::Dropped(0) => Ok((StreamResult::Dropped, buf)),
-            ReturnCode::Cancelled(0) => Ok((StreamResult::Cancelled, buf)),
+            ReturnCode::Blocked => Err((writer, buf)),
+            ReturnCode::Dropped(0) => Ok((writer, StreamResult::Dropped, buf)),
+            ReturnCode::Cancelled(0) => Ok((writer, StreamResult::Cancelled, buf)),
             code @ (ReturnCode::Completed(amt)
             | ReturnCode::Dropped(amt)
             | ReturnCode::Cancelled(amt)) => {
                 let amt = amt.try_into().unwrap();
                 buf.advance(amt);
                 if let ReturnCode::Dropped(_) = code {
-                    self.writer.done = true;
+                    writer.done = true;
                 }
-                Ok((StreamResult::Complete(amt), buf))
+                Ok((writer, StreamResult::Complete(amt), buf))
             }
         }
     }
 
-    fn in_progress_waitable(&mut self, _: &Self::InProgress) -> u32 {
-        self.writer.handle
+    fn in_progress_waitable(&mut self, (writer, _): &Self::InProgress) -> u32 {
+        writer.handle
     }
 
-    fn in_progress_cancel(&mut self, _: &mut Self::InProgress) -> u32 {
+    fn in_progress_cancel(&mut self, (writer, _): &mut Self::InProgress) -> u32 {
         // SAFETY: we're managing `writer` and all the various operational bits,
         // so this relies on `WaitableOperation` being safe.
-        let code = unsafe { self.writer.ops.cancel_write(self.writer.handle) };
-        rtdebug!("stream.cancel-write({}) = {code:#x}", self.writer.handle);
+        let code = unsafe { writer.ops.cancel_write(writer.handle) };
+        rtdebug!("stream.cancel-write({}) = {code:#x}", writer.handle);
         code
     }
 
     fn result_into_cancel(&mut self, result: Self::Result) -> Self::Cancel {
         result
     }
+
+    fn detach_on_drop() -> bool
+    where
+        Self: Sized,
+    {
+        true
+    }
 }
 
-impl<O: StreamOps> Future for RawStreamWrite<'_, O> {
-    type Output = (StreamResult, AbiBuffer<O>);
+impl<O: StreamOps> Future for RawStreamWrite<O> {
+    type Output = (RawStreamWriter<O>, StreamResult, AbiBuffer<O>);
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.pin_project().poll_complete(cx)
     }
 }
 
-impl<'a, O: StreamOps> RawStreamWrite<'a, O> {
-    fn pin_project(self: Pin<&mut Self>) -> Pin<&mut WaitableOperation<StreamWriteOp<'a, O>>> {
+impl<O: StreamOps> RawStreamWrite<O> {
+    fn pin_project(self: Pin<&mut Self>) -> Pin<&mut WaitableOperation<StreamWriteOp<O>>> {
         // SAFETY: we've chosen that when `Self` is pinned that it translates to
         // always pinning the inner field, so that's codified here.
         unsafe { Pin::new_unchecked(&mut self.get_unchecked_mut().op) }
@@ -452,8 +459,10 @@ impl<'a, O: StreamOps> RawStreamWrite<'a, O> {
     ///
     /// Panics if the operation has already been completed via `Future::poll`,
     /// or if this method is called twice.
-    pub fn cancel(self: Pin<&mut Self>) -> (StreamResult, AbiBuffer<O>) {
-        self.pin_project().cancel()
+    pub async fn cancel(
+        self: Pin<&mut Self>,
+    ) -> (RawStreamWriter<O>, StreamResult, AbiBuffer<O>) {
+        self.pin_project().cancel_async().await
     }
 }
 
@@ -519,10 +528,10 @@ impl<O: StreamOps> RawStreamReader<O> {
     /// Cancelling the returned future can be done with `drop` like all Rust
     /// futures, but it does not mean that no values were read. To accurately
     /// determine if values were read the [`StreamRead::cancel`] method must be
-    /// used.
-    pub fn read(&mut self, buf: Vec<O::Payload>) -> RawStreamRead<'_, O> {
+    /// awaited.
+    pub fn read(self, buf: Vec<O::Payload>) -> RawStreamRead<O> {
         RawStreamRead {
-            op: WaitableOperation::new(StreamReadOp { reader: self }, buf),
+            op: WaitableOperation::new(StreamReadOp(std::marker::PhantomData), (self, buf)),
         }
     }
 
@@ -530,11 +539,11 @@ impl<O: StreamOps> RawStreamReader<O> {
     ///
     /// This is a higher-level method than [`StreamReader::read`] in that it
     /// reads only a single item and does not expose control over cancellation.
-    pub async fn next(&mut self) -> Option<O::Payload> {
+    pub async fn next(self) -> (Self, Option<O::Payload>) {
         // TODO: should amortize this allocation and avoid doing it every time.
         // Or somehow perhaps make this more optimal.
-        let (_result, mut buf) = self.read(Vec::with_capacity(1)).await;
-        buf.pop()
+        let (reader, _result, mut buf) = self.read(Vec::with_capacity(1)).await;
+        (reader, buf.pop())
     }
 
     /// Reads all items from this stream and returns the list.
@@ -550,7 +559,8 @@ impl<O: StreamOps> RawStreamReader<O> {
             if ret.len() == ret.capacity() {
                 ret.reserve(1);
             }
-            let (status, buf) = self.read(ret).await;
+            let (reader, status, buf) = self.read(ret).await;
+            self = reader;
             ret = buf;
             match status {
                 StreamResult::Complete(_) => {}
@@ -575,26 +585,24 @@ impl<O: StreamOps> Drop for RawStreamReader<O> {
 }
 
 /// Represents a read operation which may be cancelled prior to completion.
-pub type StreamRead<'a, T> = RawStreamRead<'a, &'static StreamVtable<T>>;
+pub type StreamRead<T> = RawStreamRead<&'static StreamVtable<T>>;
 
 /// Represents a read operation which may be cancelled prior to completion.
-pub struct RawStreamRead<'a, O: StreamOps> {
-    op: WaitableOperation<StreamReadOp<'a, O>>,
+pub struct RawStreamRead<O: StreamOps> {
+    op: WaitableOperation<StreamReadOp<O>>,
 }
 
-struct StreamReadOp<'a, O: StreamOps> {
-    reader: &'a mut RawStreamReader<O>,
-}
+struct StreamReadOp<O: StreamOps>(std::marker::PhantomData<O>);
 
-unsafe impl<'a, O: StreamOps> WaitableOp for StreamReadOp<'a, O> {
-    type Start = Vec<O::Payload>;
-    type InProgress = (Vec<O::Payload>, Option<Cleanup>);
-    type Result = (StreamResult, Vec<O::Payload>);
-    type Cancel = (StreamResult, Vec<O::Payload>);
+unsafe impl<O: StreamOps> WaitableOp for StreamReadOp<O> {
+    type Start = (RawStreamReader<O>, Vec<O::Payload>);
+    type InProgress = (RawStreamReader<O>, Vec<O::Payload>, Option<Cleanup>);
+    type Result = (RawStreamReader<O>, StreamResult, Vec<O::Payload>);
+    type Cancel = (RawStreamReader<O>, StreamResult, Vec<O::Payload>);
 
-    fn start(&mut self, mut buf: Self::Start) -> (u32, Self::InProgress) {
-        if self.reader.done {
-            return (DROPPED, (buf, None));
+    fn start(&mut self, (mut reader, mut buf): Self::Start) -> (u32, Self::InProgress) {
+        if reader.done {
+            return (DROPPED, (reader, buf, None));
         }
 
         let cap = buf.spare_capacity_mut();
@@ -603,11 +611,11 @@ unsafe impl<'a, O: StreamOps> WaitableOp for StreamReadOp<'a, O> {
         // If `T` requires a lifting operation, then allocate a slab of memory
         // which will store the canonical ABI read. Otherwise we can use the
         // raw capacity in `buf` itself.
-        if self.reader.ops.native_abi_matches_canonical_abi() {
+        if reader.ops.native_abi_matches_canonical_abi() {
             ptr = cap.as_mut_ptr().cast();
             cleanup = None;
         } else {
-            let elem_layout = self.reader.ops.elem_layout();
+            let elem_layout = reader.ops.elem_layout();
             let layout =
                 Layout::from_size_align(elem_layout.size() * cap.len(), elem_layout.align())
                     .unwrap();
@@ -615,40 +623,36 @@ unsafe impl<'a, O: StreamOps> WaitableOp for StreamReadOp<'a, O> {
         }
         // SAFETY: `ptr` is either in `buf` or in `cleanup`, both of which will
         // persist with this async operation itself.
-        let code = unsafe {
-            self.reader
-                .ops
-                .start_read(self.reader.handle(), ptr, cap.len())
-        };
+        let code = unsafe { reader.ops.start_read(reader.handle(), ptr, cap.len()) };
         rtdebug!(
             "stream.read({}, {ptr:?}, {}) = {code:#x}",
-            self.reader.handle(),
+            reader.handle(),
             cap.len()
         );
-        (code, (buf, cleanup))
+        (code, (reader, buf, cleanup))
     }
 
-    fn start_cancelled(&mut self, buf: Self::Start) -> Self::Cancel {
-        (StreamResult::Cancelled, buf)
+    fn start_cancelled(&mut self, (reader, buf): Self::Start) -> Self::Cancel {
+        (reader, StreamResult::Cancelled, buf)
     }
 
     fn in_progress_update(
         &mut self,
-        (mut buf, cleanup): Self::InProgress,
+        (mut reader, mut buf, cleanup): Self::InProgress,
         code: u32,
     ) -> Result<Self::Result, Self::InProgress> {
         match ReturnCode::decode(code) {
-            ReturnCode::Blocked => Err((buf, cleanup)),
+            ReturnCode::Blocked => Err((reader, buf, cleanup)),
 
             // Note that the `cleanup`, if any, is discarded here.
-            ReturnCode::Dropped(0) => Ok((StreamResult::Dropped, buf)),
+            ReturnCode::Dropped(0) => Ok((reader, StreamResult::Dropped, buf)),
 
             // When an in-progress read is successfully cancelled then the
             // allocation that was being read into, if any, is just discarded.
             //
             // TODO: should maybe thread this around like `AbiBuffer` to cache
             // the read allocation?
-            ReturnCode::Cancelled(0) => Ok((StreamResult::Cancelled, buf)),
+            ReturnCode::Cancelled(0) => Ok((reader, StreamResult::Cancelled, buf)),
 
             code @ (ReturnCode::Completed(amt)
             | ReturnCode::Dropped(amt)
@@ -657,7 +661,7 @@ unsafe impl<'a, O: StreamOps> WaitableOp for StreamReadOp<'a, O> {
                 let cur_len = buf.len();
                 assert!(amt <= buf.capacity() - cur_len);
 
-                if self.reader.ops.native_abi_matches_canonical_abi() {
+                if reader.ops.native_abi_matches_canonical_abi() {
                     // If no `lift` was necessary, then the results of this operation
                     // were read directly into `buf`, so just update its length now that
                     // values have been initialized.
@@ -673,8 +677,8 @@ unsafe impl<'a, O: StreamOps> WaitableOp for StreamReadOp<'a, O> {
                         .unwrap_or(ptr::null_mut());
                     for _ in 0..amt {
                         unsafe {
-                            buf.push(self.reader.ops.lift(ptr));
-                            ptr = ptr.add(self.reader.ops.elem_layout().size());
+                            buf.push(reader.ops.lift(ptr));
+                            ptr = ptr.add(reader.ops.elem_layout().size());
                         }
                     }
                 }
@@ -683,43 +687,50 @@ unsafe impl<'a, O: StreamOps> WaitableOp for StreamReadOp<'a, O> {
                 // allocations have been read from it and appended to `buf`.
                 drop(cleanup);
                 if let ReturnCode::Dropped(_) = code {
-                    self.reader.done = true;
+                    reader.done = true;
                 }
-                Ok((StreamResult::Complete(amt), buf))
+                Ok((reader, StreamResult::Complete(amt), buf))
             }
         }
     }
 
-    fn in_progress_waitable(&mut self, _: &Self::InProgress) -> u32 {
-        self.reader.handle()
+    fn in_progress_waitable(&mut self, (reader, _, _): &Self::InProgress) -> u32 {
+        reader.handle()
     }
 
-    fn in_progress_cancel(&mut self, _: &mut Self::InProgress) -> u32 {
+    fn in_progress_cancel(&mut self, (reader, _, _): &mut Self::InProgress) -> u32 {
         // SAFETY: we're managing `reader` and all the various operational bits,
         // so this relies on `WaitableOperation` being safe.
-        let code = unsafe { self.reader.ops.cancel_read(self.reader.handle()) };
-        rtdebug!("stream.cancel-read({}) = {code:#x}", self.reader.handle());
+        let code = unsafe { reader.ops.cancel_read(reader.handle()) };
+        rtdebug!("stream.cancel-read({}) = {code:#x}", reader.handle());
         code
     }
 
     fn result_into_cancel(&mut self, result: Self::Result) -> Self::Cancel {
         result
     }
+
+    fn detach_on_drop() -> bool
+    where
+        Self: Sized,
+    {
+        true
+    }
 }
 
-impl<O: StreamOps> Future for RawStreamRead<'_, O> {
-    type Output = (StreamResult, Vec<O::Payload>);
+impl<O: StreamOps> Future for RawStreamRead<O> {
+    type Output = (RawStreamReader<O>, StreamResult, Vec<O::Payload>);
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.pin_project().poll_complete(cx)
     }
 }
 
-impl<'a, O> RawStreamRead<'a, O>
+impl<O> RawStreamRead<O>
 where
     O: StreamOps,
 {
-    fn pin_project(self: Pin<&mut Self>) -> Pin<&mut WaitableOperation<StreamReadOp<'a, O>>> {
+    fn pin_project(self: Pin<&mut Self>) -> Pin<&mut WaitableOperation<StreamReadOp<O>>> {
         // SAFETY: we've chosen that when `Self` is pinned that it translates to
         // always pinning the inner field, so that's codified here.
         unsafe { Pin::new_unchecked(&mut self.get_unchecked_mut().op) }
@@ -738,7 +749,9 @@ where
     ///
     /// Panics if the operation has already been completed via `Future::poll`,
     /// or if this method is called twice.
-    pub fn cancel(self: Pin<&mut Self>) -> (StreamResult, Vec<O::Payload>) {
-        self.pin_project().cancel()
+    pub async fn cancel(
+        self: Pin<&mut Self>,
+    ) -> (RawStreamReader<O>, StreamResult, Vec<O::Payload>) {
+        self.pin_project().cancel_async().await
     }
 }
