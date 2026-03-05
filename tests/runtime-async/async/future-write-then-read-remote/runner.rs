@@ -1,4 +1,3 @@
-//@ args = '--async=-all'
 //@ wasmtime-flags = '-Wcomponent-model-async'
 
 include!(env!("BINDINGS"));
@@ -10,14 +9,12 @@ struct Component;
 export!(Component);
 
 impl Guest for Component {
-    fn run() {
-        wit_bindgen::block_on(async {
-            let (tx, rx) = wit_future::new(|| unreachable!());
+    async fn run() {
+        let (tx, rx) = wit_future::new(|| unreachable!());
 
-            let a = async { tx.write(()).await };
-            let b = async { f(rx) };
-            let (a_result, ()) = futures::join!(a, b);
-            a_result.unwrap();
-        });
+        let a = tx.write(());
+        let b = f(rx);
+        let (a_result, ()) = futures::join!(a, b);
+        a_result.unwrap();
     }
 }

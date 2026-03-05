@@ -18,9 +18,9 @@ extern_wasm! {
         fn unit_write(stream: u32, val: *const u8, amt: usize) -> u32;
         #[link_name = "[async-lower][stream-read-unit]"]
         fn unit_read(stream: u32, val: *mut u8, amt: usize) -> u32;
-        #[link_name = "[stream-cancel-read-unit]"]
+        #[link_name = "[async-lower][stream-cancel-read-unit]"]
         fn unit_cancel_read(stream: u32) -> u32;
-        #[link_name = "[stream-cancel-write-unit]"]
+        #[link_name = "[async-lower][stream-cancel-write-unit]"]
         fn unit_cancel_write(stream: u32) -> u32;
         #[link_name = "[stream-drop-readable-unit]"]
         fn unit_drop_readable(stream: u32) ;

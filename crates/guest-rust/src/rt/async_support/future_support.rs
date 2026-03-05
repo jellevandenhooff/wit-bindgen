@@ -343,11 +343,11 @@ impl<T> FutureWriter<T> {
     ///
     /// # Cancellation
     ///
-    /// The returned future can be cancelled normally via `drop` which means
-    /// that the `value` provided here, along with this `FutureWriter` itself,
-    /// will be lost. There is also [`FutureWrite::cancel`] which can be used to
-    /// possibly re-acquire `value` and `self` if the operation was cancelled.
-    /// In such a situation the operation can be retried at a future date.
+    /// Dropping the returned future detaches the write and allows it to
+    /// continue in the background. There is also [`FutureWrite::cancel`] which
+    /// can be awaited to possibly re-acquire `value` and `self` if the
+    /// operation was cancelled. In such a situation the operation can be
+    /// retried at a future date.
     pub fn write(mut self, value: T) -> FutureWrite<T> {
         let raw = unsafe { ManuallyDrop::take(&mut self.raw).write(value) };
         let default = self.default;
@@ -437,9 +437,9 @@ impl<T: 'static> FutureWrite<T> {
     ///
     /// Panics if the operation has already been completed via `Future::poll`,
     /// or if this method is called twice.
-    pub fn cancel(self: Pin<&mut Self>) -> FutureWriteCancel<T> {
+    pub async fn cancel(self: Pin<&mut Self>) -> FutureWriteCancel<T> {
         let default = self.default;
-        match self.pin_project().cancel() {
+        match self.pin_project().cancel().await {
             RawFutureWriteCancel::AlreadySent => FutureWriteCancel::AlreadySent,
             RawFutureWriteCancel::Dropped(val) => FutureWriteCancel::Dropped(val),
             RawFutureWriteCancel::Cancelled(val, raw) => FutureWriteCancel::Cancelled(
@@ -455,24 +455,7 @@ impl<T: 'static> FutureWrite<T> {
 }
 
 impl<T: 'static> Drop for FutureWrite<T> {
-    fn drop(&mut self) {
-        if self.raw.op.is_done() {
-            return;
-        }
-
-        // Although the underlying `WaitableOperation` will already
-        // auto-cancel-on-drop we need to specially handle that here because if
-        // the cancellation goes through then it means that no value will have
-        // been written to this future which will cause a trap. By using
-        // `Self::cancel` it's ensured that if cancellation succeeds a
-        // `FutureWriter` is created. In `Drop for FutureWriter` that'll handle
-        // the last-ditch write-default logic.
-        //
-        // SAFETY: we're in the destructor here so the value `self` is about
-        // to go away and we can guarantee we're not moving out of it.
-        let pin = unsafe { Pin::new_unchecked(self) };
-        pin.cancel();
-    }
+    fn drop(&mut self) {}
 }
 
 /// Raw version of [`FutureWriter`].
@@ -706,6 +689,13 @@ unsafe impl<O: FutureOps> WaitableOp for FutureWriteOp<O> {
             WriteComplete::Cancelled(val) => RawFutureWriteCancel::Cancelled(val, writer),
         }
     }
+
+    fn detach_on_drop() -> bool
+    where
+        Self: Sized,
+    {
+        true
+    }
 }
 
 impl<O: FutureOps> Future for RawFutureWrite<O> {
@@ -732,8 +722,8 @@ impl<O: FutureOps> RawFutureWrite<O> {
 
     /// Same as [`FutureWrite::cancel`], but returns a [`RawFutureWriteCancel`]
     /// instead.
-    pub fn cancel(self: Pin<&mut Self>) -> RawFutureWriteCancel<O> {
-        self.pin_project().cancel()
+    pub async fn cancel(self: Pin<&mut Self>) -> RawFutureWriteCancel<O> {
+        self.pin_project().cancel_async().await
     }
 }
 
@@ -949,6 +939,13 @@ unsafe impl<O: FutureOps> WaitableOp for FutureReadOp<O> {
             ReadComplete::Cancelled => Err(reader),
         }
     }
+
+    fn detach_on_drop() -> bool
+    where
+        Self: Sized,
+    {
+        true
+    }
 }
 
 impl<O: FutureOps> Future for RawFutureRead<O> {
@@ -959,7 +956,8 @@ impl<O: FutureOps> Future for RawFutureRead<O> {
             .poll_complete(cx)
             .map(|(result, _reader)| match result {
                 ReadComplete::Value(val) => val,
-                // This is only possible if, after calling `FutureRead::cancel`,
+                // This is only possible if, after calling
+                // `FutureRead::cancel().await`,
                 // the future is polled again. The `cancel` method is documented
                 // as "don't do that" so this is left to panic.
                 ReadComplete::Cancelled => panic!("cannot poll after cancelling"),
@@ -988,7 +986,7 @@ impl<O: FutureOps> RawFutureRead<O> {
     /// Panics if the operation has already been completed via `Future::poll`,
     /// or if this method is called twice. Additionally if this method completes
     /// then calling `poll` again on `self` will panic.
-    pub fn cancel(self: Pin<&mut Self>) -> Result<O::Payload, RawFutureReader<O>> {
-        self.pin_project().cancel()
+    pub async fn cancel(self: Pin<&mut Self>) -> Result<O::Payload, RawFutureReader<O>> {
+        self.pin_project().cancel_async().await
     }
 }

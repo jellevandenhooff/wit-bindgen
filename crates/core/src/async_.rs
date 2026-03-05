@@ -16,7 +16,7 @@ pub struct AsyncFilterSet {
     /// passed here can be one of:
     ///
     /// - `all` - all imports and exports will be async
-    /// - `-all` - force all imports and exports to be sync
+    /// - `-all` - force sync bindings where possible
     /// - `foo:bar/baz#method` - force this method to be async
     /// - `import:foo:bar/baz#method` - force this method to be async, but only
     ///   as an import
@@ -25,6 +25,7 @@ pub struct AsyncFilterSet {
     /// If a method is not listed in this option then the WIT's default bindings
     /// mode will be used. If the WIT function is defined as `async` then async
     /// bindings will be generated, otherwise sync bindings will be generated.
+    /// Async WIT functions always remain async in generated Rust bindings.
     ///
     /// Options are processed in the order they are passed here, so if a method
     /// matches two directives passed the least-specific one should be last.
@@ -75,11 +76,17 @@ impl AsyncFilterSet {
             Some(key) => format!("{}#{}", resolve.name_world_key(key), func.name),
             None => func.name.clone(),
         };
+        let inherent_async = matches!(
+            &func.kind,
+            FunctionKind::AsyncFreestanding
+                | FunctionKind::AsyncMethod(_)
+                | FunctionKind::AsyncStatic(_)
+        );
         for (i, opt) in self.async_.iter().enumerate() {
             let name = match &opt.filter {
                 AsyncFilter::All => {
                     self.used_options.insert(i);
-                    return opt.enabled;
+                    return inherent_async || opt.enabled;
                 }
                 AsyncFilter::Function(s) => s,
                 AsyncFilter::Import(s) => {
@@ -97,19 +104,11 @@ impl AsyncFilterSet {
             };
             if *name == name_to_test {
                 self.used_options.insert(i);
-                return opt.enabled;
+                return inherent_async || opt.enabled;
             }
         }
 
-        match &func.kind {
-            FunctionKind::Freestanding
-            | FunctionKind::Method(_)
-            | FunctionKind::Static(_)
-            | FunctionKind::Constructor(_) => false,
-            FunctionKind::AsyncFreestanding
-            | FunctionKind::AsyncMethod(_)
-            | FunctionKind::AsyncStatic(_) => true,
-        }
+        inherent_async
     }
 
     /// Intended to be used in the header comment of generated code to help
